@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+SNPeek - simple threaded port scanner + banner grabber (lab use only)
+
+Usage examples:
+  python3 snpeek.py 192.168.1.10 22,80,443
+  python3 snpeek.py 192.168.1.0/24 22 --workers 100 --output ssh_hosts.csv
+  python3 snpeek.py example.com 80 --allow-public   # USE WITH PERMISSION
+
+Requirements: Python 3.8+
+
+IMPORTANT: Use only on networks you own or have explicit permission to test.
+"""
+import argparse
+import socket
+import threading
+import queue
+import time
+import csv
+from ipaddress import ip_network, ip_address
+import sys
+import os
+import re
+
+# Defaults
+WORKERS_DEFAULT = 200
+SOCKET_TIMEOUT = 0.6
+BANNER_RECV_TIMEOUT = 0.8
+
+# Optional color support
+try:
+    from colorama import init as _cinit, Fore, Style
+    _cinit(autoreset=True)
+    COLOR = True
+except Exception:
+    COLOR = False
+    class _DummyColor:
+        def __getattr__(self, name):
+            return ""
+    Fore = Style = _DummyColor()
+
+# Banner / Branding
+def banner(author="Rahade", name="SNPeek", version="0.1"):
+    """Display startup banner"""
+    try:
+        if os.name == 'nt':
+            os.system('cls')
+        else:
+            os.system('clear')
+    except Exception:
+        pass
+
+    if COLOR:
+        print(Fore.RED + "===================================")
+        print(Fore.RED + f"         {name} Tools v{version}       ")
+        print(Fore.RED + f"             by {author}             ")
+        print(Fore.RED + "===================================" + Style.RESET_ALL)
+    else:
+        print("===================================")
+        print(f"         {name} Tools v{version}       ")
+        print(f"             by {author}             ")
+        print("===================================")
+    time.sleep(0.3)
+
+# Target & port parsing
+def parse_targets(target_arg):
+    """Accept single IP/host or CIDR. Return list of IP strings."""
+    targets = []
+
+    if '/' in target_arg:
+        try:
+            net = ip_network(target_arg, strict=False)
+            targets = [str(ip) for ip in net.hosts()]
+        except ValueError as e:
+            raise ValueError(f"Invalid CIDR notation '{target_arg}': {e}")
+    else:
+        # Handle single IP or hostname
+        try:
+            try:
+                addr_info = socket.getaddrinfo(target_arg, None)
+                ips = sorted(set(info[4][0] for info in addr_info))
+                targets.extend(ips)
+            except socket.gaierror:
+                ip_address(target_arg)  # validate
+                targets = [target_arg]
+        except (ValueError, socket.gaierror) as e:
+            raise ValueError(f"Invalid target '{target_arg}': {e}")
+
+    return targets
+
+def parse_ports(port_arg):
+    """Accept '1-1024' or '22,80,443' or single '80'"""
+    if not port_arg:
+        return []
+
+    parts = str(port_arg).split(',')
+    ports = set()
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if '-' in part:
+            try:
+                a, b = part.split('-', 1)
+                start_port = int(a.strip())
+                end_port = int(b.strip())
+                if start_port > end_port:
+                    start_port, end_port = end_port, start_port
+                ports.update(range(start_port, end_port + 1))
+            except ValueError as e:
+                raise ValueError(f"Invalid port range '{part}': {e}")
+        else:
+            try:
+                port = int(part)
+                ports.add(port)
+            except ValueError as e:
+                raise ValueError(f"Invalid port number '{part}': {e}")
+
+    return sorted(p for p in ports if 0 < p <= 65535)
+
+# Safety: check if IP is private
+def is_private_ip(ipstr):
+    """Check if IP address is in private ranges"""
+    try:
+        ip = ip_address(ipstr)
+        return ip.is_private
+    except ValueError:
+        return False
+
+# Worker thread
+def worker(job_q, result_q, timeout=SOCKET_TIMEOUT, stop_event=None):
+    """Worker thread for port scanning"""
+    while not (stop_event and stop_event.is_set()):
+        try:
+            ip, port = job_q.get(timeout=1)
+        except queue.Empty:
+            break
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                try:
+                    sock.connect((ip, port))
+                    banner_text = ""
+                    try:
+                        sock.settimeout(BANNER_RECV_TIMEOUT)
+                        data = sock.recv(1024)
+                        if data:
+                            banner_text = re.sub(r'[\x00-\x1F\x7F-\x9F]', ' ',
+                                                 data.decode(errors='ignore').strip())
+                            banner_text = ' '.join(banner_text.split())
+                    except (socket.timeout, socket.error, UnicodeDecodeError):
+                        banner_text = ""
+
+                    result_q.put((ip, port, "open", banner_text))
+                except (socket.timeout, ConnectionRefusedError, OSError):
+                    pass
+        except Exception as e:
+            print(f"[-] Error scanning {ip}:{port}: {e}")
+        finally:
+            try:
+                job_q.task_done()
+            except Exception:
+                pass
+
+# Scan orchestration
+def scan_targets(targets, ports, workers):
+    """Orchestrate the scanning process with multiple threads"""
+    if not targets or not ports:
+        return [], 0.0
+
+    job_q = queue.Queue()
+    result_q = queue.Queue()
+    stop_event = threading.Event()
+
+    for ip in targets:
+        for port in ports:
+            job_q.put((ip, port))
+
+    threads = []
+    max_threads = min(workers, max(1, len(targets) * len(ports)))
+    for _ in range(max_threads):
+        t = threading.Thread(target=worker, args=(job_q, result_q, SOCKET_TIMEOUT, stop_event))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    start_time = time.time()
+
+    try:
+        job_q.join()
+    except KeyboardInterrupt:
+        print("\n[!] Received interrupt signal, shutting down...")
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=1.0)
+
+    duration = time.time() - start_time
+
+    results = []
+    while not result_q.empty():
+        results.append(result_q.get())
+
+    results.sort(key=lambda x: (x[0], x[1]))
+    return results, duration
+
+# Save CSV
+def save_csv(results, filename, author="Rahade"):
+    """Save results to CSV file"""
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as fh:
+            writer = csv.writer(fh)
+            writer.writerow(['IP Address', 'Port', 'State', 'Banner', 'Scanner By'])
+            for ip, port, state, banner_text in results:
+                writer.writerow([ip, port, state, banner_text, author])
+        return True
+    except (IOError, OSError) as e:
+        print(f"[-] Error saving to CSV: {e}")
+        return False
+
+# Pretty print results
+def print_results(results, duration, max_print=60):
+    """Display results in a formatted way"""
+    if not results:
+        print(f"\nScan finished in {duration:.2f}s — no open ports found.")
+        return
+
+    print(f"\nScan finished in {duration:.2f}s — found {len(results)} open port(s).\n")
+
+    to_show = results[:max_print]
+    for ip, port, state, banner_text in to_show:
+        status = f"{ip}:{port} {state}"
+        if COLOR:
+            status = Fore.GREEN + status + Style.RESET_ALL
+        print(status, end="")
+        if banner_text:
+            print(f" - {banner_text}")
+        else:
+            print()
+
+    if len(results) > max_print:
+        remaining = len(results) - max_print
+        print(f"\n... and {remaining} more open ports (truncated)")
+
+# Main CLI
+def main():
+    """Main command-line interface"""
+    global SOCKET_TIMEOUT
+
+    parser = argparse.ArgumentParser(
+        description="SNPeek - simple threaded port scanner (lab use only)",
+        epilog="Examples:\n  python3 snpeek.py 192.168.1.10 22,80\n  python3 snpeek.py 192.168.1.0/24 22 --workers 100 --output ssh_hosts.csv\n  python3 snpeek.py example.com 80 --allow-public\n"
+    )
+    parser.add_argument("target",
+                        help="target IP/CIDR/hostname (e.g. 192.168.1.10 or 192.168.1.0/24)")
+    parser.add_argument("ports",
+                        help="ports (e.g. 22,80,443 or 1-1024)")
+    parser.add_argument("-w", "--workers", type=int, default=WORKERS_DEFAULT,
+                        help=f"number of threads (default: {WORKERS_DEFAULT})")
+    parser.add_argument("-o", "--output", help="CSV filename to save results (optional)")
+    parser.add_argument("-a", "--author", default="Rahade", help="author name for signature")
+    parser.add_argument("--allow-public", action="store_true",
+                        help="allow scanning public IPs (USE RESPONSIBLY)")
+    parser.add_argument("--no-banner", action="store_true",
+                        help="don't display startup banner")
+    parser.add_argument("-t", "--timeout", type=float, default=SOCKET_TIMEOUT,
+                        help=f"socket connection timeout in seconds (default: {SOCKET_TIMEOUT})")
+
+    args = parser.parse_args()
+
+    if not args.no_banner:
+        banner(author=args.author)
+
+    # set timeout from args
+    if args.timeout != SOCKET_TIMEOUT:
+        SOCKET_TIMEOUT = args.timeout
+
+    # Parse targets & ports
+    try:
+        targets = parse_targets(args.target)
+        if not targets:
+            print("[-] No valid targets found.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"[-] Failed to parse target: {e}")
+        sys.exit(1)
+
+    try:
+        ports = parse_ports(args.ports)
+        if not ports:
+            print("[-] No valid ports specified.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"[-] Failed to parse ports: {e}")
+        sys.exit(1)
+
+    # Safety check for public IPs
+    if not args.allow_public:
+        public_targets = [t for t in targets if not is_private_ip(t)]
+        if public_targets:
+            print("[-] The following targets are not in private IP ranges:")
+            for target in public_targets[:5]:
+                print(f"    {target}")
+            if len(public_targets) > 5:
+                print(f"    ... and {len(public_targets) - 5} more")
+            print("\n[!] Use --allow-public to override (ONLY with proper authorization!)")
+            sys.exit(1)
+
+    total_scans = len(targets) * len(ports)
+    if total_scans > 10000 and not args.allow_public:
+        print(f"[!] You're about to perform {total_scans:,} port scans.")
+        response = input("Type 'YES' to continue: ")
+        if response != 'YES':
+            print("Scan cancelled.")
+            sys.exit(0)
+
+    print(f"[*] Targets: {len(targets)} IP(s)")
+    print(f"[*] Ports: {len(ports)} port(s)")
+    print(f"[*] Workers: {args.workers}")
+    print(f"[*] Total scans: {total_scans:,}")
+    print("[*] Starting scan (for authorized testing only)...")
+
+    try:
+        results, duration = scan_targets(targets, ports, args.workers)
+        print_results(results, duration)
+
+        if args.output and results:
+            if save_csv(results, args.output, author=args.author):
+                print(f"[+] Results saved to {args.output}")
+            else:
+                print(f"[-] Failed to save results to {args.output}")
+
+    except KeyboardInterrupt:
+        print("\n[!] Scan interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[-] Unexpected error during scan: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

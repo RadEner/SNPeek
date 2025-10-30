@@ -1,0 +1,22 @@
+# Changelog
+
+All notable changes to SNPeek will be documented in this file.
+
+## [0.2.0] - YYYY-MM-DD
+### Added
+- Interactive-first workflow with robust fallback from CLI.
+- Automatic CSV filename normalization (append `.csv` if missing).
+- Worker count validation and MAX_ALLOWED_THREADS safety cap.
+- Option to allow scanning public IPs in interactive mode.
+- Improved error messages and input validation on Visual Studio Code
+
+### Changed
+- Default worker count reduced from 200 to 100 for safer defaults on laptops.
+- Banner display timing shortened and duplicate-banner prevention.
+
+### Fixed
+- Robust handling when stdin is not interactive (Debug Console).
+- Minor fixes to CSV saving and thread caps.
+
+## [0.1.0] - YYYY-MM-DD
+- Initial release: basic threaded port scanner + banner grabber with argparse.
